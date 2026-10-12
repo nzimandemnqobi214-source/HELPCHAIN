@@ -1,0 +1,120 @@
+name: Deploy HelpChain API to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "HELPCHAIN-main (1).zip"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate deployment variables
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_ARTIFACT_REGISTRY: ${{ vars.GCP_ARTIFACT_REGISTRY }}
+          CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+          CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT: ${{ vars.CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT }}
+          FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          for key in GCP_PROJECT_ID GCP_REGION GCP_ARTIFACT_REGISTRY CLOUD_RUN_SERVICE CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT FIREBASE_PROJECT_ID GCP_WORKLOAD_IDENTITY_PROVIDER GCP_DEPLOY_SERVICE_ACCOUNT; do
+            if [ -z "${!key}" ]; then
+              echo "::error::Missing GitHub Actions variable: $key"
+              exit 1
+            fi
+          done
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        env:
+          GCP_REGION: ${{ vars.GCP_REGION }}
+        run: gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+
+      - name: Extract tracked project archive
+        run: |
+          set -euo pipefail
+          mkdir -p .api-source
+          unzip -q "HELPCHAIN-main (1).zip" -d .api-source
+          test -f .api-source/HELPCHAIN-main/Dockerfile.api
+          test -f .api-source/HELPCHAIN-main/artifacts/api-server/src/index.ts
+
+      - name: Build and push API image
+        id: image
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_ARTIFACT_REGISTRY: ${{ vars.GCP_ARTIFACT_REGISTRY }}
+        run: |
+          set -euo pipefail
+          image="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GCP_ARTIFACT_REGISTRY}/helpchain-api:${GITHUB_SHA}"
+          docker build \
+            --file .api-source/HELPCHAIN-main/Dockerfile.api \
+            --tag "$image" \
+            .api-source/HELPCHAIN-main
+          docker push "$image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy API to Cloud Run
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+          CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT: ${{ vars.CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT }}
+          FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          gcloud run deploy "$CLOUD_RUN_SERVICE" \
+            --project "$GCP_PROJECT_ID" \
+            --region "$GCP_REGION" \
+            --image "$IMAGE" \
+            --service-account "$CLOUD_RUN_RUNTIME_SERVICE_ACCOUNT" \
+            --port 8080 \
+            --allow-unauthenticated \
+            --set-env-vars "NODE_ENV=production,FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID}" \
+            --set-secrets "FIREBASE_SERVICE_ACCOUNT_JSON=helpchain-firebase-service-account:latest,EMAIL_OTP_SECRET=helpchain-email-otp-secret:latest,SMTP_HOST=helpchain-smtp-host:latest,SMTP_PORT=helpchain-smtp-port:latest,SMTP_SECURE=helpchain-smtp-secure:latest,SMTP_USER=helpchain-smtp-user:latest,SMTP_PASSWORD=helpchain-smtp-password:latest,SMTP_FROM=helpchain-smtp-from:latest,DONATION_EXPIRY_SECRET=helpchain-donation-expiry-secret:latest"
+
+      - name: Verify API health and report URL
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+        run: |
+          set -euo pipefail
+          service_url="$(gcloud run services describe "$CLOUD_RUN_SERVICE" \
+            --project "$GCP_PROJECT_ID" \
+            --region "$GCP_REGION" \
+            --format='value(status.url)')"
+          if [ -z "$service_url" ]; then
+            echo "::error::Cloud Run did not return a service URL."
+            exit 1
+          fi
+          curl --fail --show-error --silent --retry 10 --retry-delay 5 --retry-connrefused \
+            "$service_url/api/healthz"
+          {
+            echo "## HelpChain API deployed"
+            echo "Service URL: $service_url"
+            echo "Health check: $service_url/api/healthz"
+          } >> "$GITHUB_STEP_SUMMARY"
